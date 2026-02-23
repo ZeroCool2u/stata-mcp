@@ -1073,80 +1073,36 @@ async function executeInteractiveCommand(panel, command, host, port) {
     }
 }
 
-// Helper to execute command and update webview
-async function executeInteractiveCommand(panel, command, host, port) {
-    if (!command || !command.trim()) return;
-
-    // Check if restarting
-    if (isRestarting) {
-        panel.webview.postMessage({
-            command: 'output',
-            text: 'Stata session is restarting. Please wait.',
-            isError: true
-        });
-        return;
-    }
-
-    try {
-        const config = getConfig();
-        const cmdHost = config.get('mcpServerHost') || host || 'localhost';
-        const cmdPort = config.get('mcpServerPort') || port || 4000;
-        const cmdTimeout = config.get('runSelectionTimeout') || 600;
-
-        // Use run_selection tool via MCP
-        const response = await axios.post(
-            `http://${cmdHost}:${cmdPort}/v1/tools`,
-            {
-                tool: 'run_selection',
-                parameters: { selection: command, skip_filter: true }
-            },
-            { headers: { 'Content-Type': 'application/json' }, timeout: cmdTimeout * 1000 }
-        );
-
-        if (response.status === 200 && response.data.status === 'success') {
-            const result = response.data.result || 'Command executed';
-            const cmdGraphs = parseGraphsFromOutput(result);
-
-            // Convert graph paths to Webview URIs
-            const processedGraphs = cmdGraphs.map(g => {
-                // Use panel.webview.asWebviewUri to create a URI that works in the webview
-                // This handles remote environments automatically
-                const fileUri = vscode.Uri.file(g.path);
-                const webviewUri = panel.webview.asWebviewUri(fileUri);
-                return {
-                    name: g.name,
-                    url: webviewUri.toString()
-                };
-            });
-
-            panel.webview.postMessage({
-                command: 'commandResult',
-                executedCommand: command,
-                result: result,
-                graphs: processedGraphs
-            });
-        } else {
-            panel.webview.postMessage({
-                command: 'error',
-                text: response.data.message || 'Command failed'
-            });
-        }
-    } catch (error) {
-        panel.webview.postMessage({
-            command: 'error',
-            text: error.message
-        });
-    }
-}
-
 async function createOrShowInteractiveWindow(host, port, filePath, initialCommand = null) {
+    const extensionPath = globalContext.extensionPath || __dirname;
+    const graphsDir = path.join(extensionPath, 'graphs');
+    const fileDir = path.dirname(filePath);
+
+    // Check if we need to recreate the panel (if fileDir is not in allowed roots)
+    if (interactivePanel) {
+        // Simple check: strict equality of fileDir or checking against stored allowed roots
+        // Since we can't easily check actual localResourceRoots from the webview object public API without storing it,
+        // we'll rely on a custom property we attach.
+        const allowedRoots = interactivePanel._allowedRoots || [];
+
+        // Check if the current fileDir is allowed.
+        // We use a simple strategy: if the exact fileDir is not in the list, we assume it's a context switch.
+        // We could do subdirectory checking, but keeping it simple and safe is better for now.
+        const isAllowed = allowedRoots.some(root => {
+            // Check if fileDir is the root or a subdirectory of root
+            const rel = path.relative(root, fileDir);
+            return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+        });
+
+        if (!isAllowed) {
+            console.log('[createOrShowInteractiveWindow] Context switch detected, recreating panel');
+            interactivePanel.dispose();
+            interactivePanel = null;
+        }
+    }
+
     // Create or reuse interactive panel
     if (!interactivePanel) {
-        // Get graph directory to allow loading images
-        const extensionPath = globalContext.extensionPath || __dirname;
-        const graphsDir = path.join(extensionPath, 'graphs');
-        const fileDir = path.dirname(filePath);
-
         interactivePanel = vscode.window.createWebviewPanel(
             'stataInteractive',
             'Stata Interactive Window',
@@ -1161,6 +1117,9 @@ async function createOrShowInteractiveWindow(host, port, filePath, initialComman
                 ]
             }
         );
+
+        // Store allowed roots as strings for future checks
+        interactivePanel._allowedRoots = [extensionPath, graphsDir, fileDir];
 
         // Reset panel reference when closed
         interactivePanel.onDidDispose(() => {
@@ -1184,6 +1143,13 @@ async function createOrShowInteractiveWindow(host, port, filePath, initialComman
         const fileName = path.basename(filePath);
         // Pass cspSource for proper security
         interactivePanel.webview.html = getInteractiveWindowHtml(fileName, '', '', interactivePanel.webview.cspSource);
+    } else {
+        // Reuse existing panel: update the file name in the header
+        const fileName = path.basename(filePath);
+        interactivePanel.webview.postMessage({
+            command: 'updateFile',
+            text: fileName
+        });
     }
 
     // Reveal the panel
@@ -1429,6 +1395,11 @@ function getInteractiveWindowHtml(fileName, output, graphsHtml, cspSource) {
                 cell.style.marginBottom = '15px';
                 outputContainer.appendChild(cell);
                 outputContainer.scrollTop = outputContainer.scrollHeight;
+            } else if (message.command === 'updateFile') {
+                const headerFile = document.querySelector('.header .file-name');
+                if (headerFile) {
+                    headerFile.textContent = 'File: ' + message.text;
+                }
             }
             runButton.disabled = false;
             runButton.textContent = 'Run';
