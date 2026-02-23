@@ -1302,7 +1302,7 @@ function getInteractiveWindowHtml(fileName, output, graphsHtml, cspSource) {
 <body>
     <div class="header">
         <h1>📊 Stata Interactive Window</h1>
-        <div class="file-name">File: ${fileName}</div>
+        <div class="file-name">File: ${escapeHtml(fileName)}</div>
     </div>
 
     <div class="section">
