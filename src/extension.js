@@ -965,7 +965,7 @@ async function restartStataSession() {
 let interactivePanel = null; // Global reference to interactive window
 
 async function runInteractive() {
-    console.log('[runInteractive] Command triggered - opening browser');
+    console.log('[runInteractive] Command triggered');
     const editor = vscode.window.activeTextEditor;
     if (!editor) {
         vscode.window.showErrorMessage('No active editor');
@@ -979,7 +979,6 @@ async function runInteractive() {
         return;
     }
 
-    // Execute the file and capture output
     const config = getConfig();
     const host = config.get('mcpServerHost') || 'localhost';
     const port = config.get('mcpServerPort') || 4000;
@@ -992,71 +991,174 @@ async function runInteractive() {
         }
     }
 
-    // Get selected text or use full file
     const selection = editor.selection;
-    let codeToRun = '';
-    let urlParams = '';
+    let initialCommand = null;
 
     if (!selection.isEmpty) {
-        // Use selected code
-        codeToRun = editor.document.getText(selection);
-        const encodedCode = encodeURIComponent(codeToRun);
-        urlParams = `code=${encodedCode}`;
+        initialCommand = editor.document.getText(selection);
         console.log('[runInteractive] Using selected code');
     } else {
         // Use full file
-        const encodedFilePath = encodeURIComponent(filePath);
-        urlParams = `file=${encodedFilePath}`;
+        initialCommand = `do "${filePath}"`;
         console.log('[runInteractive] Using full file:', filePath);
     }
 
-    // Open the interactive webpage in the system's default browser
-    // Using direct system commands to bypass VS Code's Simple Browser
-    const url = `http://${host}:${port}/interactive?${urlParams}`;
-    console.log('[runInteractive] Opening URL in system browser:', url);
+    // Open Webview
+    await createOrShowInteractiveWindow(host, port, filePath, initialCommand);
+}
+
+// Helper to execute command and update webview
+async function executeInteractiveCommand(panel, command, host, port) {
+    if (!command || !command.trim()) return;
+
+    // Check if restarting
+    if (isRestarting) {
+        panel.webview.postMessage({
+            command: 'output',
+            text: 'Stata session is restarting. Please wait.',
+            isError: true
+        });
+        return;
+    }
 
     try {
-        let openCommand;
-        if (IS_MAC) {
-            // macOS: use 'open' command with proper URL escaping
-            // Single quotes prevent shell interpretation of special chars
-            openCommand = `open '${url.replace(/'/g, "'\\''")}'`;
-        } else if (IS_WINDOWS) {
-            // Windows: use 'start' command
-            openCommand = `start "" "${url}"`;
+        const config = getConfig();
+        const cmdHost = config.get('mcpServerHost') || host || 'localhost';
+        const cmdPort = config.get('mcpServerPort') || port || 4000;
+        const cmdTimeout = config.get('runSelectionTimeout') || 600;
+
+        // Use run_selection tool via MCP
+        const response = await axios.post(
+            `http://${cmdHost}:${cmdPort}/v1/tools`,
+            {
+                tool: 'run_selection',
+                parameters: { selection: command, skip_filter: true }
+            },
+            { headers: { 'Content-Type': 'application/json' }, timeout: cmdTimeout * 1000 }
+        );
+
+        if (response.status === 200 && response.data.status === 'success') {
+            const result = response.data.result || 'Command executed';
+            const cmdGraphs = parseGraphsFromOutput(result);
+
+            // Convert graph paths to Webview URIs
+            const processedGraphs = cmdGraphs.map(g => {
+                // Use panel.webview.asWebviewUri to create a URI that works in the webview
+                // This handles remote environments automatically
+                const fileUri = vscode.Uri.file(g.path);
+                const webviewUri = panel.webview.asWebviewUri(fileUri);
+                return {
+                    name: g.name,
+                    url: webviewUri.toString()
+                };
+            });
+
+            panel.webview.postMessage({
+                command: 'commandResult',
+                executedCommand: command,
+                result: result,
+                graphs: processedGraphs
+            });
         } else {
-            // Linux: use 'xdg-open' command
-            openCommand = `xdg-open '${url.replace(/'/g, "'\\''")}'`;
+            panel.webview.postMessage({
+                command: 'error',
+                text: response.data.message || 'Command failed'
+            });
         }
-
-        console.log('[runInteractive] Executing command:', openCommand);
-        exec(openCommand, (error) => {
-            if (error) {
-                console.error('[runInteractive] Error opening browser:', error);
-                vscode.window.showErrorMessage(`Failed to open browser: ${error.message}`);
-            } else {
-                console.log('[runInteractive] Browser opened successfully');
-            }
-        });
-
-        vscode.window.showInformationMessage('Stata Interactive Window opened in your browser!');
     } catch (error) {
-        console.error('[runInteractive] Error:', error);
-        vscode.window.showErrorMessage(`Failed to open browser: ${error.message}`);
+        panel.webview.postMessage({
+            command: 'error',
+            text: error.message
+        });
     }
 }
 
-async function showInteractiveWindow(filePath, output, graphs, host, port) {
+// Helper to execute command and update webview
+async function executeInteractiveCommand(panel, command, host, port) {
+    if (!command || !command.trim()) return;
+
+    // Check if restarting
+    if (isRestarting) {
+        panel.webview.postMessage({
+            command: 'output',
+            text: 'Stata session is restarting. Please wait.',
+            isError: true
+        });
+        return;
+    }
+
+    try {
+        const config = getConfig();
+        const cmdHost = config.get('mcpServerHost') || host || 'localhost';
+        const cmdPort = config.get('mcpServerPort') || port || 4000;
+        const cmdTimeout = config.get('runSelectionTimeout') || 600;
+
+        // Use run_selection tool via MCP
+        const response = await axios.post(
+            `http://${cmdHost}:${cmdPort}/v1/tools`,
+            {
+                tool: 'run_selection',
+                parameters: { selection: command, skip_filter: true }
+            },
+            { headers: { 'Content-Type': 'application/json' }, timeout: cmdTimeout * 1000 }
+        );
+
+        if (response.status === 200 && response.data.status === 'success') {
+            const result = response.data.result || 'Command executed';
+            const cmdGraphs = parseGraphsFromOutput(result);
+
+            // Convert graph paths to Webview URIs
+            const processedGraphs = cmdGraphs.map(g => {
+                // Use panel.webview.asWebviewUri to create a URI that works in the webview
+                // This handles remote environments automatically
+                const fileUri = vscode.Uri.file(g.path);
+                const webviewUri = panel.webview.asWebviewUri(fileUri);
+                return {
+                    name: g.name,
+                    url: webviewUri.toString()
+                };
+            });
+
+            panel.webview.postMessage({
+                command: 'commandResult',
+                executedCommand: command,
+                result: result,
+                graphs: processedGraphs
+            });
+        } else {
+            panel.webview.postMessage({
+                command: 'error',
+                text: response.data.message || 'Command failed'
+            });
+        }
+    } catch (error) {
+        panel.webview.postMessage({
+            command: 'error',
+            text: error.message
+        });
+    }
+}
+
+async function createOrShowInteractiveWindow(host, port, filePath, initialCommand = null) {
     // Create or reuse interactive panel
     if (!interactivePanel) {
+        // Get graph directory to allow loading images
+        const extensionPath = globalContext.extensionPath || __dirname;
+        const graphsDir = path.join(extensionPath, 'graphs');
+        const fileDir = path.dirname(filePath);
+
         interactivePanel = vscode.window.createWebviewPanel(
             'stataInteractive',
             'Stata Interactive Window',
-            { viewColumn: vscode.ViewColumn.Active, preserveFocus: false },
+            { viewColumn: vscode.ViewColumn.Two, preserveFocus: false },
             {
                 enableScripts: true,
                 retainContextWhenHidden: true,
-                localResourceRoots: []
+                localResourceRoots: [
+                    vscode.Uri.file(extensionPath),
+                    vscode.Uri.file(graphsDir),
+                    vscode.Uri.file(fileDir)
+                ]
             }
         );
 
@@ -1065,94 +1167,44 @@ async function showInteractiveWindow(filePath, output, graphs, host, port) {
             interactivePanel = null;
         });
 
-        // Handle messages from webview (command execution)
+        // Handle messages from webview
         interactivePanel.webview.onDidReceiveMessage(
             async message => {
                 switch (message.command) {
                     case 'runCommand':
-                        if (isRestarting) {
-                            interactivePanel.webview.postMessage({
-                                command: 'output',
-                                text: 'Stata session is restarting. Please wait.',
-                                isError: true
-                            });
-                            break;
-                        }
-                        try {
-                            const config = getConfig();
-                            const cmdHost = config.get('mcpServerHost') || 'localhost';
-                            const cmdPort = config.get('mcpServerPort') || 4000;
-                            const cmdTimeout = config.get('runSelectionTimeout') || 600;  // Default 600 seconds
-
-                            const response = await axios.post(
-                                `http://${cmdHost}:${cmdPort}/v1/tools`,
-                                {
-                                    tool: 'run_selection',
-                                    parameters: { selection: message.text, skip_filter: true }
-                                },
-                                { headers: { 'Content-Type': 'application/json' }, timeout: cmdTimeout * 1000 }
-                            );
-
-                            if (response.status === 200 && response.data.status === 'success') {
-                                const result = response.data.result || 'Command executed';
-                                const cmdGraphs = parseGraphsFromOutput(result);
-
-                                interactivePanel.webview.postMessage({
-                                    command: 'commandResult',
-                                    executedCommand: message.text,
-                                    result: result,
-                                    graphs: cmdGraphs.map(g => ({
-                                        name: g.name,
-                                        url: `http://${cmdHost}:${cmdPort}/graphs/${encodeURIComponent(g.name)}`
-                                    }))
-                                });
-                            } else {
-                                interactivePanel.webview.postMessage({
-                                    command: 'error',
-                                    text: response.data.message || 'Command failed'
-                                });
-                            }
-                        } catch (error) {
-                            interactivePanel.webview.postMessage({
-                                command: 'error',
-                                text: error.message
-                            });
-                        }
+                        await executeInteractiveCommand(interactivePanel, message.text, host, port);
                         break;
                 }
             },
             undefined,
             []
         );
+
+        // Generate initial HTML content
+        const fileName = path.basename(filePath);
+        // Pass cspSource for proper security
+        interactivePanel.webview.html = getInteractiveWindowHtml(fileName, '', '', interactivePanel.webview.cspSource);
     }
 
     // Reveal the panel
-    interactivePanel.reveal(vscode.ViewColumn.Active);
+    interactivePanel.reveal(vscode.ViewColumn.Two);
 
-    // Generate HTML content
-    const fileName = path.basename(filePath);
-    const graphsHtml = graphs.map(graph => {
-        const graphUrl = `http://${host}:${port}/graphs/${encodeURIComponent(graph.name)}`;
-        return `
-            <div class="graph-container">
-                <h3>${graph.name}</h3>
-                <img src="${graphUrl}" alt="${graph.name}"
-                     onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
-                <div class="error" style="display:none;">Failed to load graph: ${graph.name}</div>
-            </div>
-        `;
-    }).join('');
-
-    interactivePanel.webview.html = getInteractiveWindowHtml(fileName, output, graphsHtml);
+    // Execute initial command if provided
+    if (initialCommand) {
+        await executeInteractiveCommand(interactivePanel, initialCommand, host, port);
+    }
 }
 
-function getInteractiveWindowHtml(fileName, output, graphsHtml) {
+function getInteractiveWindowHtml(fileName, output, graphsHtml, cspSource) {
+    // If cspSource not provided (legacy call), default to wildcard but it's safer to require it
+    const cspSrc = cspSource || 'https:';
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src http://localhost:* http://127.0.0.1:* https://*; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${cspSrc} http://localhost:* https://*; style-src 'unsafe-inline'; script-src 'unsafe-inline';">
     <title>Stata Interactive Window</title>
     <style>
         body {
@@ -1363,6 +1415,17 @@ function getInteractiveWindowHtml(fileName, output, graphsHtml) {
                 const cell = document.createElement('div');
                 cell.className = 'error';
                 cell.textContent = 'Error: ' + message.text;
+                cell.style.marginBottom = '15px';
+                outputContainer.appendChild(cell);
+                outputContainer.scrollTop = outputContainer.scrollHeight;
+            } else if (message.command === 'output') {
+                const cell = document.createElement('div');
+                if (message.isError) {
+                    cell.className = 'error';
+                    cell.textContent = message.text;
+                } else {
+                    cell.textContent = message.text;
+                }
                 cell.style.marginBottom = '15px';
                 outputContainer.appendChild(cell);
                 outputContainer.scrollTop = outputContainer.scrollHeight;
